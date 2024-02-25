@@ -11,7 +11,8 @@ import { parse } from "https://deno.land/std@0.203.0/path/parse.ts";
 import { posixFormat } from "https://deno.land/std@0.203.0/path/_format.ts";
 import { scheduleOnceIfDuplicated } from "./lib/src/lock.ts";
 import { DispatchFun, Peer } from "./Peer.ts";
-import { walk } from "https://deno.land/std@0.209.0/fs/walk.ts";
+
+import chokidar from "npm:chokidar";
 
 
 export class PeerStorage extends Peer {
@@ -56,11 +57,13 @@ export class PeerStorage extends Peer {
             }
             const fp = await Deno.open(path, { read: true, write: true, create: true });
             if (data.data instanceof Uint8Array) {
-                await fp.write(data.data);
+                const writtensize = await fp.write(data.data);
+                await fp.truncate(writtensize);
             } else {
-                await fp.write(new TextEncoder().encode(getDocData(data.data)));
+                const writtensize = await fp.write(new TextEncoder().encode(getDocData(data.data)));
+                await fp.truncate(writtensize);
             }
-            await Deno.futime(fp.rid, new Date(data.mtime), new Date(data.mtime));
+            await fp.utime(new Date(data.mtime), new Date(data.mtime));
             fp.close();
             this.receiveLog(`${lp} saved`);
             await this.writeFileStat(pathSrc);
@@ -151,7 +154,8 @@ export class PeerStorage extends Peer {
         }
         return ret;
     }
-    watcher: Deno.FsWatcher | undefined;
+    watcher?: chokidar.FSWatcher;
+
     async dispatch(pathSrc: string) {
         const lP = this.toStoragePath(this.toLocalPath("."));
         const path = this.toPosixPath(relative(lP, pathSrc));
@@ -232,40 +236,37 @@ export class PeerStorage extends Peer {
         }
         const lP = this.toStoragePath(this.toLocalPath("."));
         this.normalLog(`Scan offline changes: ${this.config.scanOfflineChanges ? "Enabled, now starting..." : "Disabled"}`);
-        if (this.config.scanOfflineChanges) {
-            for await (const entry of walk(lP)) {
-                const ePath = this.toPosixPath(relative(this.toLocalPath("."), entry.path));
-                if (!await this.isChanged(ePath)) {
-                    // this.debugLog(`Not changed: ${ePath}`);
-                } else {
-                    this.debugLog(`Changes detected: ${ePath}`);
-                    await this.dispatch(entry.path);
-                }
+        this.watcher = chokidar.watch(lP,
+            {
+                ignoreInitial: !this.config.scanOfflineChanges,
+                awaitWriteFinish: {
+                    stabilityThreshold: 500,
+                },
+            });
+
+        this.watcher.on("change",async (path)=>{
+            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            if (!await this.isChanged(ePath)) {
+                // this.debugLog(`Not changed: ${ePath}`);
+            } else {
+                this.debugLog(`Changes detected: ${ePath}`);
+                await this.dispatch(path);
             }
-            this.normalLog(`Scan offline changes: Finished`);
-        }
-
-        this.watcher = Deno.watchFs(lP, { recursive: true });
-        for await (const event of this.watcher) {
-            // Logger(`${event.kind} ${event.paths.join(",")}`);
-            switch (event.kind) {
-                case "create":
-                    event.paths.forEach(e => this.dispatch(e));
-                    break;
-                case "modify":
-                    event.paths.forEach(e => this.dispatch(e));
-                    break;
-                case "remove":
-                    event.paths.forEach(e => this.dispatchDeleted(e));
-                    break;
-
-                case "any":
-                case "access":
-                case "other":
-                default:
-
+        })
+        this.watcher.on("add",async (path)=>{
+            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            if (!await this.isChanged(ePath)) {
+                // this.debugLog(`Not changed: ${ePath}`);
+            } else {
+                this.debugLog(`New detected: ${ePath}`);
+                await this.dispatch(path);
             }
-        }
+        })
+        this.watcher.on("unlink",async (path)=>{
+            const ePath = this.toPosixPath(relative(this.toLocalPath("."), path));
+            this.debugLog(`Unlink detected: ${ePath}`);
+            this.dispatchDeleted(path)
+        })
     }
     async stop() {
         this.watcher?.close();
